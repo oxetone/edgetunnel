@@ -2,9 +2,11 @@ import { createServer } from 'http';
 import { parse } from 'url';
 import { WebSocketServer, WebSocket } from 'ws';
 import { index401, serverStaticFile } from './app/utils';
-import * as uuid from 'uuid';
-import * as lodash from 'lodash';
+import { validate } from 'uuid';
 import { createReadStream } from 'node:fs';
+import { setDefaultResultOrder } from 'node:dns';
+import { createSocket, Socket as UDPSocket } from 'node:dgram';
+
 import {
   makeReadableWebSocketStream,
   processVlessHeader,
@@ -13,10 +15,20 @@ import {
 } from 'vless-js';
 import { connect, Socket } from 'node:net';
 import { Duplex, Readable } from 'stream';
-
+import {
+  TransformStream,
+  ReadableStream,
+  WritableStream,
+} from 'node:stream/web';
 const port = process.env.PORT;
 const userID = process.env.UUID || '';
-let isVaildUser = uuid.validate(userID);
+//'ipv4first' or 'verbatim'
+const dnOder = process.env.DNSORDER || 'verbatim';
+if (dnOder === 'ipv4first') {
+  setDefaultResultOrder(dnOder);
+}
+
+let isVaildUser = validate(userID);
 if (!isVaildUser) {
   console.log('not set valid UUID');
 }
@@ -65,30 +77,54 @@ const server = createServer((req, resp) => {
 });
 const vlessWServer = new WebSocketServer({ noServer: true });
 
-vlessWServer.on('connection', async function connection(ws) {
+vlessWServer.on('connection', async function connection(ws, request) {
   let address = '';
   let portWithRandomLog = '';
   try {
     const log = (info: string, event?: any) => {
       console.log(`[${address}:${portWithRandomLog}] ${info}`, event || '');
     };
-    let remoteConnection: Socket = null;
+    let remoteConnection: Duplex = null;
+    let udpClientStream: TransformStream = null;
     let remoteConnectionReadyResolve: Function;
-
-    const readableWebSocketStream = makeReadableWebSocketStream(ws, log);
+    const earlyDataHeader = request.headers['sec-websocket-protocol'];
+    const readableWebSocketStream = makeReadableWebSocketStream(
+      ws,
+      earlyDataHeader,
+      log
+    );
     let vlessResponseHeader: Uint8Array | null = null;
 
-    // ws --> remote
+    // ws  --> remote
     readableWebSocketStream
       .pipeTo(
         new WritableStream({
           async write(chunk: Buffer, controller) {
+            if (!Buffer.isBuffer(chunk)) {
+              chunk = Buffer.from(chunk);
+            }
+            if (udpClientStream) {
+              const writer = udpClientStream.writable.getWriter();
+              // nodejs buffer to ArrayBuffer issue
+              // https://nodejs.org/dist/latest-v18.x/docs/api/buffer.html#bufbuffer
+              await writer.write(
+                chunk.buffer.slice(
+                  chunk.byteOffset,
+                  chunk.byteOffset + chunk.length
+                )
+              );
+              writer.releaseLock();
+              return;
+            }
             if (remoteConnection) {
               await socketAsyncWrite(remoteConnection, chunk);
               // remoteConnection.write(chunk);
               return;
             }
-            const vlessBuffer = chunk.buffer.slice(chunk.byteOffset);
+            const vlessBuffer = chunk.buffer.slice(
+              chunk.byteOffset,
+              chunk.byteOffset + chunk.length
+            );
             const {
               hasError,
               message,
@@ -96,28 +132,42 @@ vlessWServer.on('connection', async function connection(ws) {
               addressRemote,
               rawDataIndex,
               vlessVersion,
-            } = processVlessHeader(vlessBuffer, userID, uuid, lodash);
+              isUDP,
+            } = processVlessHeader(vlessBuffer, userID);
             address = addressRemote || '';
-            portWithRandomLog = `${portRemote}--${Math.random()}`;
+            portWithRandomLog = `${portRemote}--${Math.random()} ${
+              isUDP ? 'udp ' : 'tcp '
+            } `;
             if (hasError) {
               controller.error(`[${address}:${portWithRandomLog}] ${message} `);
             }
             // const addressType = requestAddr >> 42
             // const addressLength = requestAddr & 0x0f;
             console.log(`[${address}:${portWithRandomLog}] connecting`);
-            remoteConnection = await connect2Remote(portRemote, address, log);
             vlessResponseHeader = new Uint8Array([vlessVersion![0], 0]);
-
             const rawClientData = vlessBuffer.slice(rawDataIndex!);
-            remoteConnection.write(new Uint8Array(rawClientData));
-            remoteConnectionReadyResolve(remoteConnection);
+            if (isUDP) {
+              udpClientStream = makeUDPSocketStream(portRemote, address);
+              const writer = udpClientStream.writable.getWriter();
+              writer.write(rawClientData).catch(error=>console.log)
+              writer.releaseLock();
+              remoteConnectionReadyResolve(udpClientStream);
+            } else {
+              remoteConnection = await connect2Remote(portRemote, address, log);
+              remoteConnection.write(new Uint8Array(rawClientData));
+              remoteConnectionReadyResolve(remoteConnection);
+            }
           },
           close() {
+            // if (udpClientStream ) {
+            //   udpClientStream.writable.close();
+            // }
             console.log(
               `[${address}:${portWithRandomLog}] readableWebSocketStream is close`
             );
           },
           abort(reason) {
+            // TODO: log can be remove, abort will catch by catch block
             console.log(
               `[${address}:${portWithRandomLog}] readableWebSocketStream is abort`,
               JSON.stringify(reason)
@@ -138,9 +188,13 @@ vlessWServer.on('connection', async function connection(ws) {
 
     await new Promise((resolve) => (remoteConnectionReadyResolve = resolve));
     // remote --> ws
-    let remoteChunkCount = 0;
-    let totoal = 0;
-    await Readable.toWeb(remoteConnection).pipeTo(
+    let responseStream = udpClientStream?.readable;
+    if (remoteConnection) {
+      responseStream = Readable.toWeb(remoteConnection);
+    }
+
+    // if readable not pipe can't wait fro writeable write method
+    await responseStream.pipeTo(
       new WritableStream({
         start() {
           if (ws.readyState === ws.OPEN) {
@@ -148,7 +202,10 @@ vlessWServer.on('connection', async function connection(ws) {
           }
         },
         async write(chunk: Uint8Array, controller) {
-          await wsAsyncWrite(ws, chunk);
+          // console.log('ws write', chunk);
+          if (ws.readyState === ws.OPEN) {
+            await wsAsyncWrite(ws, chunk);
+          }
         },
         close() {
           console.log(
@@ -181,9 +238,15 @@ server.on('upgrade', function upgrade(request, socket, head) {
   });
 });
 
-server.listen(port, () => {
-  console.log(`server listen in http://127.0.0.1:${port}`);
-});
+server.listen(
+  {
+    port: port,
+    host: '0.0.0.0',
+  },
+  () => {
+    console.log(`server listen in http://127.0.0.1:${port}`);
+  }
+);
 
 async function connect2Remote(port, host, log: Function): Promise<Socket> {
   return new Promise((resole, reject) => {
@@ -191,6 +254,8 @@ async function connect2Remote(port, host, log: Function): Promise<Socket> {
       {
         port: port,
         host: host,
+        // https://github.com/nodejs/node/pull/46587
+        // autoSelectFamily: true,
       },
       () => {
         log(`connected`);
@@ -203,7 +268,7 @@ async function connect2Remote(port, host, log: Function): Promise<Socket> {
   });
 }
 
-async function socketAsyncWrite(ws: Socket, chunk: Buffer) {
+async function socketAsyncWrite(ws: Duplex, chunk: Buffer) {
   return new Promise((resolve, reject) => {
     ws.write(chunk, (error) => {
       if (error) {
@@ -225,4 +290,66 @@ async function wsAsyncWrite(ws: WebSocket, chunk: Uint8Array) {
       }
     });
   });
+}
+
+function makeUDPSocketStream(portRemote, address) {
+  const udpClient = createSocket('udp4');
+  const transformStream = new TransformStream({
+    start(controller) {
+      /* … */
+      udpClient.on('message', (message, info) => {
+        controller.enqueue(
+          Buffer.concat([new Uint8Array([0, info.size]), message])
+        );
+      });
+      udpClient.on('error', (error) => {
+        console.log('udpClient error event', error);
+        controller.error(error);
+      });
+    },
+
+    async transform(chunk: ArrayBuffer, controller) {
+      //seems v2ray will use same web socket for dns query..
+      //And v2ray will combine A record and AAAA record into one ws message and use 2 btye for dns query length
+      for (let index = 0; index < chunk.byteLength; ) {
+        const lengthBuffer = chunk.slice(index, index + 2);
+        const udpPakcetLength = new DataView(lengthBuffer).getInt16(0);
+        const udpData = new Uint8Array(
+          chunk.slice(index + 2, index + 2 + udpPakcetLength)
+        );
+        index = index + 2 + udpPakcetLength;
+       await new Promise((resolve, reject)=>{
+        udpClient.send(udpData, portRemote, address, (err) => {
+          if (err) {
+            console.log('udps send error', err);
+            controller.error(`Failed to send UDP packet !! ${err}`);
+            safeCloseUDP(udpClient);
+          }
+          resolve(true)
+        });
+       })
+        index = index;
+      }
+
+      // console.log('dns chunk', chunk);
+      // console.log(portRemote, address);
+      // port is big-Endian in raw data etc 80 == 0x005d
+    },
+
+    flush(controller) {
+      safeCloseUDP(udpClient);
+      controller.terminate();
+    },
+  });
+  return transformStream;
+}
+
+
+function safeCloseUDP(client: UDPSocket){
+  try{
+    client.close()
+  }catch(error){
+    console.log('error close udp', error);
+  }
+
 }

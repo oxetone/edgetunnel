@@ -4,14 +4,11 @@
 
 本项目通过，使用 `js` 实现 `VLESS`协议， 使得 **V2ray** 可以部署到一些 Edge 或者 Serverless 平台上。
 
-**v2ray-heroku 由于 heroku 取消免费，项目已经死了。这里是新的项目。**
-
 > For international user, I write this readme in Chinese. But I understand English pretty well, if you has any issue, please open it in Github.
 
 > 项目正在完善阶段，欢迎大家使用，如果发现 bug， 请开 issue。
 > **请定期按照 github 的提示，同步最新代码。只需要在乎下图红框的提示，其他提示不要点击**。
-> 如果你喜欢自动化，可以使用这个自动同步 fork https://github.com/apps/pull
-> ![sync](./doc/sync.jpg)
+> 如果你喜欢自动化，可以使用这个自动同步 fork https://github.com/apps/pull > ![sync](./doc/sync.jpg)
 
 > 同步完成后，如果发现不一样，**请看文档**。
 
@@ -48,6 +45,14 @@ https://blog.cloudflare.com/introducing-socket-workers/
 ### render.com
 
 [render](./doc/render.md)
+
+### Docker
+
+``` bash
+docker run -d -p 4600:4100 -e UUID=ce6d9073-7085-4cb1-a64d-382489a2af94 zizifn/node-vless:latest
+```
+> 如果你想让 DNS IPV4 优先， 请设置环境变量DNSORDER=ipv4first
+
 
 ## 客户端 v2rayN 配置
 
